@@ -2,18 +2,20 @@ package gowrk
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"text/tabwriter"
 	"time"
 )
 
-func countBytesReader(reader io.Reader) (int64, error) {
+func countBytes(reader io.Reader) (int64, error) {
 	var count int64
 
 	buffer := make([]byte, 1024)
@@ -47,8 +49,10 @@ func calcMin(a, b time.Duration) time.Duration {
 }
 
 type request struct {
-	id  int
-	url string
+	id     int
+	url    string
+	method string
+	body   io.Reader
 }
 
 type result struct {
@@ -68,14 +72,27 @@ type Wrk struct {
 }
 
 func (w *Wrk) sendRequest(request *request) *result {
+	method := "GET"
+	if request.method != "" {
+		method = request.method
+	}
+	if request.method == "" && request.body != nil {
+		method = "POST"
+	}
 	result := &result{}
-	resp, err := http.Get(request.url)
+	req, err := http.NewRequest(method, request.url, request.body)
+	if err != nil {
+		log.Panic(err)
+	}
+	// TODO: cookie support
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		result.err = err
 		return result
 	}
+	defer resp.Body.Close()
 
-	size, err := countBytesReader(resp.Body)
+	size, err := countBytes(resp.Body)
 	if err != nil {
 		result.err = err
 		return result
@@ -97,11 +114,14 @@ func printMap(arr []map[string]interface{}, writer io.Writer) {
 	to.Flush()
 }
 
-func Start(targetURL string, c, n int, unique, dump bool) {
+func Start(targetURL string, c, n int, unique bool, dump, file string) {
 	var dumpWriter *tabwriter.Writer
 
-	if dump {
-		dumpFile, err := os.Create("./dump.csv")
+	if dump != "" {
+		dumpFile, err := os.OpenFile(dump, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, 0644)
+		if err != nil {
+			log.Panic(err)
+		}
 		dumpWriter = tabwriter.NewWriter(dumpFile, 0, 0, 3, ' ', tabwriter.TabIndent)
 		if err != nil {
 			log.Fatal(err)
@@ -120,15 +140,11 @@ func Start(targetURL string, c, n int, unique, dump bool) {
 	}
 
 	var wg sync.WaitGroup
-	var wg2 sync.WaitGroup
 
-	i := 0
-	for i < c {
+	for i := 0; i < c; i++ {
 		wg.Add(1)
-		wg2.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			defer wg2.Done()
 
 			for request := range wrk.requests {
 				start := time.Now()
@@ -140,11 +156,10 @@ func Start(targetURL string, c, n int, unique, dump bool) {
 				wrk.results <- result
 			}
 		}(i)
-		i++
 	}
 
 	go func() {
-		wg2.Wait()
+		wg.Wait()
 		close(wrk.results)
 	}()
 
@@ -155,72 +170,23 @@ func Start(targetURL string, c, n int, unique, dump bool) {
 	var max time.Duration
 	var min time.Duration
 
-	wg.Add(1)
+	var ch = make(chan struct{})
 	go func() {
-		defer wg.Done()
-		var i int64
-		var errorMessage string
-
-		start := time.Now()
-
-		if dump {
-			fmt.Fprintf(dumpWriter, "id,\tthread,\tDuration,\tSize,\tStatus Code,\terror\n")
-		}
-
-		for result := range wrk.results {
-			errorMessage = ""
-
-			if result.err != nil {
-				errors++
-				errorMessage = result.err.Error()
-			} else {
-				if min == 0 {
-					min = result.duration
-				}
-
-				max = calcMax(max, result.duration)
-				min = calcMin(min, result.duration)
-				avgDuration += int64(result.duration)
-				avgSize += result.size
-				i++
-			}
-
-			if dump {
-				fmt.Fprintf(dumpWriter, "%d,\t%d,\t%s,\t%d,\t%d,\t%s\n", result.id, result.threadID, result.duration, result.size, result.statusCode, errorMessage)
-			}
-		}
-
-		if i > 0 {
-			avgDuration = avgDuration / i
-			avgSize = avgSize / i
-		}
-
-		totalTime = time.Since(start)
+		defer func() {
+			ch <- struct{}{}
+		}()
+		consumeResults(wrk.results, dumpWriter)
 	}()
 
 	go func() {
-		url, err := url.Parse(targetURL)
+		err := produceRequest(targetURL, file, n, unique, wrk.requests)
 		if err != nil {
-			log.Fatal(err)
+			log.Panic(err)
 		}
-
-		query := url.Query()
-
-		i := 0
-		for i < n {
-			fmt.Printf("\rProcessing: %%%d", int(float32(i)/float32(n)*100))
-			if unique {
-				query.Set("__", fmt.Sprintf("%d", time.Now().UnixNano()))
-				url.RawQuery = query.Encode()
-			}
-			wrk.requests <- &request{id: i + 1, url: url.String()}
-			i++
-		}
-		fmt.Printf("\rFinished sending requests\n\n")
 		close(wrk.requests)
 	}()
 
-	wg.Wait()
+	<-ch
 
 	var output bytes.Buffer
 	printMap([]map[string]interface{}{
@@ -235,5 +201,160 @@ func Start(targetURL string, c, n int, unique, dump bool) {
 		map[string]interface{}{"Errors": errors},
 	}, &output)
 
-	fmt.Println(string(output.Bytes()))
+	log.Println(string(output.Bytes()))
+}
+
+func produceRequest(targetURL, file string, n int, unique bool, reqChan chan<- *request) error {
+	var requests []*request
+	if _, err := os.Stat(file); os.IsExist(err) {
+		log.Printf("Read request from file: %s", file)
+		reqMaps, err := readJSONFile(file)
+		if err != nil {
+			return err
+		}
+		for i, req := range reqMaps {
+			requests = append(requests, &request{
+				id:     i,
+				url:    req["url"],
+				method: req["method"],
+				body:   strings.NewReader(req["body"]),
+			})
+		}
+	} else {
+		for i := 0; i < n; i++ {
+			requests = append(requests, &request{
+				id:  i,
+				url: targetURL,
+			})
+		}
+	}
+
+	if unique {
+		if err := setUnique(requests); err != nil {
+			return err
+		}
+	}
+
+	for _, req := range requests {
+		reqChan <- req
+	}
+
+	log.Printf("\rFinished sending requests\n\n")
+	return nil
+}
+
+func readJSONFile(file string) ([]map[string]string, error) {
+	reader, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	decoder := json.NewDecoder(reader)
+	var result []map[string]string
+	err = decoder.Decode(result)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func setUnique(requests []*request) error {
+	for _, req := range requests {
+		url, err := url.Parse(req.url)
+		if err != nil {
+			return err
+		}
+		query := url.Query()
+		query.Set("__", fmt.Sprintf("%d", time.Now().UnixNano()))
+		url.RawQuery = query.Encode()
+		req.url = url.String()
+	}
+	return nil
+}
+
+// stat store some statistics data
+type stat struct {
+	avgDuration              time.Duration
+	avgSize                  int64
+	count                    int
+	nerror                   int
+	totalSize                int64
+	totalDuration            time.Duration // avgDuration*count
+	totalTime                time.Duration // consume result cost time
+	minDuration, maxDuration time.Duration
+}
+
+func consumeResults(resChan <-chan *result, dumpWriter io.Writer) *stat {
+	if dumpWriter != nil {
+		fmt.Fprintf(dumpWriter, "%s\n",
+			strings.Join([]string{
+				"id",
+				"NThread",
+				"Duration",
+				"Size",
+				"Status",
+				"Code",
+				"Error",
+			}, ",\t"))
+	}
+
+	var (
+		nerror        int
+		totalSize     int64
+		count         int
+		totalDuration time.Duration
+		min, max      time.Duration
+
+		start        = time.Now()
+		errorMessage string
+	)
+	// maybe we need sort results by id
+	for result := range resChan {
+		errorMessage = ""
+		if result.err != nil {
+			nerror++
+			errorMessage = result.err.Error()
+		} else {
+			if min == 0 {
+				min = result.duration
+			}
+
+			max = calcMax(max, result.duration)
+			min = calcMin(min, result.duration)
+			totalDuration += result.duration
+			totalSize += result.size
+			count++
+		}
+
+		if dumpWriter != nil {
+			fmt.Fprintf(
+				dumpWriter,
+				"%d,\t%d,\t%s,\t%d,\t%d,\t%s\n",
+				result.id,
+				result.threadID,
+				result.duration,
+				result.size,
+				result.statusCode,
+				errorMessage)
+		}
+	}
+
+	var avgDuration time.Duration
+	var avgSize int64
+	if count > 0 {
+		avgDuration = totalDuration / time.Duration(count)
+		avgSize = totalSize / int64(count)
+	}
+
+	totalTime := time.Since(start)
+	return &stat{
+		avgDuration:   avgDuration,
+		avgSize:       avgSize,
+		count:         count,
+		nerror:        nerror,
+		totalSize:     totalSize,
+		totalTime:     totalTime,
+		totalDuration: totalDuration,
+		minDuration:   min,
+		maxDuration:   max,
+	}
 }
