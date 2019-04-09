@@ -1,1 +1,4 @@
-dump.csv
+*
+!*.go
+!README.md
+!.gitignore

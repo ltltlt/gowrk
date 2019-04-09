@@ -2,6 +2,7 @@ package gowrk
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -115,21 +116,19 @@ func printMap(arr []map[string]interface{}, writer io.Writer) {
 }
 
 func Start(targetURL string, c, n int, unique bool, dump, file string) {
-	var dumpWriter *tabwriter.Writer
+	var writer *csv.Writer
 
 	if dump != "" {
-		dumpFile, err := os.OpenFile(dump, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, 0644)
+		f, err := os.OpenFile(dump, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, 0644)
 		if err != nil {
 			log.Panic(err)
 		}
-		dumpWriter = tabwriter.NewWriter(dumpFile, 0, 0, 3, ' ', tabwriter.TabIndent)
-		if err != nil {
-			log.Fatal(err)
-		}
+		writer = csv.NewWriter(f)
+		writer.Comma = '\t'
 
 		defer func() {
-			dumpWriter.Flush()
-			dumpFile.Close()
+			writer.Flush()
+			f.Close()
 		}()
 	}
 
@@ -163,42 +162,30 @@ func Start(targetURL string, c, n int, unique bool, dump, file string) {
 		close(wrk.results)
 	}()
 
-	var avgDuration int64
-	var avgSize int64
-	var errors int64
-	var totalTime time.Duration
-	var max time.Duration
-	var min time.Duration
-
-	var ch = make(chan struct{})
 	go func() {
-		defer func() {
-			ch <- struct{}{}
-		}()
-		consumeResults(wrk.results, dumpWriter)
-	}()
-
-	go func() {
+		defer close(wrk.requests)
 		err := produceRequest(targetURL, file, n, unique, wrk.requests)
 		if err != nil {
 			log.Panic(err)
 		}
-		close(wrk.requests)
 	}()
 
-	<-ch
+	var ch = make(chan *stat)
+	go func() {
+		ch <- consumeResults(wrk.results, writer)
+	}()
+	stat := <-ch
 
 	var output bytes.Buffer
 	printMap([]map[string]interface{}{
 		map[string]interface{}{"Concurrent": c},
-		map[string]interface{}{"Request": n},
-		map[string]interface{}{"URL": targetURL},
-		map[string]interface{}{"Total time": totalTime},
-		map[string]interface{}{"Min Duration": min},
-		map[string]interface{}{"Max Duration": max},
-		map[string]interface{}{"Average Duration": time.Duration(avgDuration)},
-		map[string]interface{}{"Average Size": fmt.Sprintf("%d bytes", avgSize)},
-		map[string]interface{}{"Errors": errors},
+		map[string]interface{}{"Request": stat.count},
+		map[string]interface{}{"Total time": stat.totalTime},
+		map[string]interface{}{"Min Duration": stat.minDuration},
+		map[string]interface{}{"Max Duration": stat.maxDuration},
+		map[string]interface{}{"Average Duration": stat.avgDuration},
+		map[string]interface{}{"Average Size": stat.avgSize},
+		map[string]interface{}{"Errors": stat.nerror},
 	}, &output)
 
 	log.Println(string(output.Bytes()))
@@ -206,8 +193,8 @@ func Start(targetURL string, c, n int, unique bool, dump, file string) {
 
 func produceRequest(targetURL, file string, n int, unique bool, reqChan chan<- *request) error {
 	var requests []*request
-	if _, err := os.Stat(file); os.IsExist(err) {
-		log.Printf("Read request from file: %s", file)
+	if _, err := os.Stat(file); !os.IsNotExist(err) {
+		log.Printf("Produce request from file: %s", file)
 		reqMaps, err := readJSONFile(file)
 		if err != nil {
 			return err
@@ -221,6 +208,7 @@ func produceRequest(targetURL, file string, n int, unique bool, reqChan chan<- *
 			})
 		}
 	} else {
+		log.Printf("Produce request from url: %s", targetURL)
 		for i := 0; i < n; i++ {
 			requests = append(requests, &request{
 				id:  i,
@@ -250,7 +238,7 @@ func readJSONFile(file string) ([]map[string]string, error) {
 	}
 	decoder := json.NewDecoder(reader)
 	var result []map[string]string
-	err = decoder.Decode(result)
+	err = decoder.Decode(&result)
 	if err != nil {
 		return nil, err
 	}
@@ -283,18 +271,16 @@ type stat struct {
 	minDuration, maxDuration time.Duration
 }
 
-func consumeResults(resChan <-chan *result, dumpWriter io.Writer) *stat {
-	if dumpWriter != nil {
-		fmt.Fprintf(dumpWriter, "%s\n",
-			strings.Join([]string{
-				"id",
-				"NThread",
-				"Duration",
-				"Size",
-				"Status",
-				"Code",
-				"Error",
-			}, ",\t"))
+func consumeResults(resChan <-chan *result, writer *csv.Writer) *stat {
+	if writer != nil {
+		writer.Write([]string{ // nolint:errcheck
+			"id",
+			"tid",
+			"Duration",
+			"Size",
+			"Status Code",
+			"Error",
+		})
 	}
 
 	var (
@@ -325,16 +311,15 @@ func consumeResults(resChan <-chan *result, dumpWriter io.Writer) *stat {
 			count++
 		}
 
-		if dumpWriter != nil {
-			fmt.Fprintf(
-				dumpWriter,
-				"%d,\t%d,\t%s,\t%d,\t%d,\t%s\n",
-				result.id,
-				result.threadID,
-				result.duration,
-				result.size,
-				result.statusCode,
-				errorMessage)
+		if writer != nil {
+			writer.Write([]string{
+				fmt.Sprint(result.id),
+				fmt.Sprint(result.threadID),
+				fmt.Sprint(result.duration),
+				fmt.Sprint(result.size),
+				fmt.Sprint(result.statusCode),
+				errorMessage,
+			})
 		}
 	}
 
